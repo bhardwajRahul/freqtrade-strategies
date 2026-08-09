@@ -19,7 +19,6 @@ class TWAPStrategy(IStrategy):
     startup_candle_count = 30
     can_short = True
     position_adjustment_enable = True
-    max_entry_position_adjustment = 10
 
     twap_num_slices = 10             # number of slices
     twap_interval_minutes = 1      # interval between slices
@@ -53,8 +52,8 @@ class TWAPStrategy(IStrategy):
 
     def ome_populate_exit_trend(self, trade: Trade, current_time: datetime) -> bool:
         """
-        Real exit trigger condition, checked directly here so it can drive a
-        sliced exit. Replace with your actual signal/profit/time logic.
+        Exit trigger condition, checked directly here so it can drive a
+        exit. Replace with your actual signal/profit/time logic.
         """
         dataframe, _ = self.dp.get_analyzed_dataframe(
             trade.pair, self.timeframe
