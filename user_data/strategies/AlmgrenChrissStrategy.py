@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import math
 
 import pandas as pd
+import numpy as np
 from freqtrade.exchange import timeframe_to_minutes
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy
@@ -38,7 +39,7 @@ class AlmgrenChrissStrategy(IStrategy):
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         dataframe["rsi"] = ta.RSI(dataframe)
-        self._ac_update_kappa_for_pair(dataframe, metadata["pair"])
+        dataframe["kappa"] = self._ac_kappa_series(dataframe, metadata["pair"])
         return dataframe
 
     def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
@@ -79,46 +80,39 @@ class AlmgrenChrissStrategy(IStrategy):
 
         return rsi > 55
 
-    def _ac_update_kappa_for_pair(self, dataframe: pd.DataFrame, pair: str) -> None:
-        """
-        Reference code: https://github.com/joshuapjacob/almgren-chriss-optimal-execution
-        """
-        if dataframe.empty  :
-            self.kappa[pair] = self.kappa.get(pair, self.kappa_default)
-            return
+    def _ac_kappa_series(self, dataframe: pd.DataFrame, pair: str) -> pd.Series:
+        if dataframe.empty:
+            return pd.Series(dtype=float, index=dataframe.index)
 
-        window = dataframe.tail(self.vol_window)
-        if len(window) < 5:
-            self.kappa[pair] = self.kappa.get(pair, self.kappa_default)
-            return
-
-        sigma = window["close"].std()
-        avg_spread = (window["high"] - window["low"]).mean()
-        avg_volume = window["volume"].mean()
+        sigma = dataframe["close"].rolling(self.vol_window).std()
+        avg_spread = (dataframe["high"] - dataframe["low"]).rolling(self.vol_window).mean()
+        avg_volume = dataframe["volume"].rolling(self.vol_window).mean()
 
         candle_minutes = timeframe_to_minutes(self.timeframe)
         tau = self.twap_interval_minutes / candle_minutes
+
         eta = avg_spread / (self.eta_volume_fraction * avg_volume)
         gamma = avg_spread / (self.gamma_volume_fraction * avg_volume)
         eta_tilde = eta - 0.5 * gamma * tau
+        eta_tilde = eta_tilde.where(eta_tilde > 0, eta)
 
-        if eta_tilde <= 0:
-            logger.warning(
-                "%s: eta_tilde <= 0 (eta=%.6g, gamma=%.6g, tau=%.4g); "
-                "falling back to eta_tilde=eta",
-                pair, eta, gamma, tau,
-            )
-            eta_tilde = eta
         sigma_tau = sigma * math.sqrt(tau)
         kappa_tilde_sq = (self.factor_lambda * sigma_tau ** 2) / eta_tilde
-        acosh_arg = 0.5 * kappa_tilde_sq * tau ** 2 + 1.0
-        raw_kappa = math.acosh(acosh_arg) / tau
-        new_kappa = min(raw_kappa, self.kappa_max)
-        self.kappa[pair] = new_kappa
+        acosh_arg = (0.5 * kappa_tilde_sq * tau ** 2 + 1.0).clip(lower=1.0)
+        raw_kappa = np.arccosh(acosh_arg) / tau
+
+        return raw_kappa.clip(upper=self.kappa_max).fillna(self.kappa_default)
 
 
-    def _get_kappa(self, pair: str) -> float:
-        return self.kappa.get(pair, self.kappa_default)
+
+    def _get_kappa(self, pair: str, current_time: datetime | None = None) -> float:
+        if self.dp is None:
+            return self.kappa_default
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if dataframe.empty or "kappa" not in dataframe:
+            return self.kappa_default
+        value = dataframe["kappa"].iloc[-1]
+        return self.kappa_default if pd.isna(value) else float(value)
 
     def _ac_next_slice_fraction(self, remaining_slices: int, kappa: float) -> float:
         """
