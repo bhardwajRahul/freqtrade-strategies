@@ -10,6 +10,11 @@ import talib.abstract as ta
 class TWAPStrategy(IStrategy):
     """
     TWAP (Time-Weighted Average Price) execution on both entry and exit.
+    this strategy breaks orders into equal time-based slices to minimize market impact
+    The entry and exit signals are examples and should be adapted to your strategy.
+    
+    - twap_num_slices: desired number of execution slices.
+    - twap_interval_minutes: time between execution slices.
     """
 
     timeframe = "15m"
@@ -50,10 +55,10 @@ class TWAPStrategy(IStrategy):
 
 
 
-    def ome_populate_exit_trend(self, trade: Trade, current_time: datetime) -> bool:
+    def should_exit_partially(self, trade: Trade, current_time: datetime) -> bool:
         """
-        Exit trigger condition, checked directly here so it can drive a
-        exit. Replace with your actual signal/profit/time logic.
+        Determine whether the trade should be partially exited with slices.
+        This method is only intended to be called from strategy callbacks.
         """
         dataframe, _ = self.dp.get_analyzed_dataframe(
             trade.pair, self.timeframe
@@ -97,7 +102,7 @@ class TWAPStrategy(IStrategy):
 
         already_exiting = exit_slices_done > 0
 
-        if already_exiting or self.ome_populate_exit_trend(trade, current_time):
+        if already_exiting or self.should_exit_partially(trade, current_time):
             return self._next_exit_slice(trade, current_time, filled_exits, exit_slices_done)
 
         if entry_slices_done < self.twap_num_slices:

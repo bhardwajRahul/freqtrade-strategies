@@ -14,7 +14,20 @@ import talib.abstract as ta
 class AlmgrenChrissStrategy(IStrategy):
     """
     Almgren-Chriss optimal execution strategy.
+    Balances market impact and volatility risk using adaptive order slices.
+    The entry and exit signals are examples and should be adapted to your strategy.
+
+    Adopted from:
+    https://github.com/joshuapjacob/almgren-chriss-optimal-execution
+
+    - twap_num_slices: desired number of execution slices.
+    - twap_interval_minutes: time between execution slices.
+    - vol_window: lookback period used for calculation.
+    - factor_lambda: risk-aversion parameter.
+    - eta_volume_fraction: volume fraction used to calibrate temporary market impact.
+    - gamma_volume_fraction: volume fraction used to calibrate permanent market impact.  
     """
+    
     timeframe = "15m"
     stoploss = -0.10
     minimal_roi = {"0": 0.02}
@@ -23,19 +36,17 @@ class AlmgrenChrissStrategy(IStrategy):
     can_short = True
     position_adjustment_enable = True
 
-    twap_num_slices = 10            # number of slices
-    twap_interval_minutes = 1       # interval between slices
-    vol_window = 96                 # rolling window to use 
-    factor_lambda = 0.01            # risk-aversion - the one dial you tune globally
-    eta_volume_fraction = 0.01      # Temporary impact coef
-    gamma_volume_fraction = 0.1     # Permanent impact coef
+    twap_num_slices = 10            
+    twap_interval_minutes = 1       
+    vol_window = 96                 
+    factor_lambda = 0.01            
+    eta_volume_fraction = 0.01      
+    gamma_volume_fraction = 0.1     
 
-    kappa_default = 0.6             # default kappa 
-    kappa_max = 5.0                 # max kappa 
+    kappa_default = 0.6             
+    kappa_max = 5.0                 
 
-    def __init__(self, config: dict) -> None:
-        super().__init__(config)
-        self.kappa: dict[str, float] = {}
+
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         dataframe["rsi"] = ta.RSI(dataframe)
@@ -60,10 +71,10 @@ class AlmgrenChrissStrategy(IStrategy):
 
         return dataframe
 
-    def ome_populate_exit_trend(self, trade: Trade, current_time: datetime) -> bool:
+    def should_exit_partially(self, trade: Trade, current_time: datetime) -> bool:
         """
-        Exit trigger condition, checked directly here so it can drive a
-        exit. Replace with your actual signal/profit/time logic.
+        Determine whether the trade should be partially exited with slices.
+        This method is only intended to be called from strategy callbacks.
         """
         dataframe, _ = self.dp.get_analyzed_dataframe(
             trade.pair, self.timeframe
@@ -106,6 +117,10 @@ class AlmgrenChrissStrategy(IStrategy):
 
 
     def _get_kappa(self, pair: str, current_time: datetime | None = None) -> float:
+        """
+        Get kappa value for slices execution.
+        This method is only intended to be called from strategy callbacks.
+        """
         if self.dp is None:
             return self.kappa_default
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
@@ -113,6 +128,7 @@ class AlmgrenChrissStrategy(IStrategy):
             return self.kappa_default
         value = dataframe["kappa"].iloc[-1]
         return self.kappa_default if pd.isna(value) else float(value)
+
 
     def _ac_next_slice_fraction(self, remaining_slices: int, kappa: float) -> float:
         """
@@ -160,7 +176,7 @@ class AlmgrenChrissStrategy(IStrategy):
 
         already_exiting = exit_slices_done > 0
 
-        if already_exiting or self.ome_populate_exit_trend(trade, current_time):
+        if already_exiting or self.should_exit_partially(trade, current_time):
             return self._next_exit_slice(trade, current_time, filled_exits, exit_slices_done)
 
         if entry_slices_done < self.twap_num_slices:
