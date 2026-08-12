@@ -1,0 +1,234 @@
+from datetime import datetime, timedelta
+import math
+
+import pandas as pd
+import numpy as np
+from freqtrade.exchange import timeframe_to_minutes
+from freqtrade.persistence import Trade
+from freqtrade.strategy import IStrategy
+import logging
+logger = logging.getLogger(__name__)
+import talib.abstract as ta
+
+
+class AlmgrenChrissStrategy(IStrategy):
+    """
+    Almgren-Chriss optimal execution strategy.
+    Balances market impact and volatility risk using adaptive order slices.
+    The entry and exit signals are examples and should be adapted to your strategy.
+
+    Adopted from:
+    https://github.com/joshuapjacob/almgren-chriss-optimal-execution
+
+    - twap_num_slices: desired number of execution slices.
+    - twap_interval_minutes: time between execution slices.
+    - vol_window: lookback period used for calculation.
+    - factor_lambda: risk-aversion parameter.
+    - eta_volume_fraction: volume fraction used to calibrate temporary market impact.
+    - gamma_volume_fraction: volume fraction used to calibrate permanent market impact.  
+    """
+    
+    timeframe = "15m"
+    stoploss = -0.10
+    minimal_roi = {"0": 0.02}
+    process_only_new_candles = True
+    startup_candle_count = 30
+    can_short = True
+    position_adjustment_enable = True
+
+    twap_num_slices = 10            
+    twap_interval_minutes = 1       
+    vol_window = 96                 
+    factor_lambda = 0.01            
+    eta_volume_fraction = 0.01      
+    gamma_volume_fraction = 0.1     
+
+    kappa_default = 0.6             
+    kappa_max = 5.0                 
+
+
+
+    def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+        dataframe["rsi"] = ta.RSI(dataframe)
+        dataframe["kappa"] = self._ac_kappa_series(dataframe, metadata["pair"])
+        return dataframe
+
+    def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+
+        dataframe.loc[
+            (dataframe["rsi"] < 45) & (dataframe["volume"] > 0),
+            "enter_long",
+        ] = 1
+
+        # Short entry
+        dataframe.loc[
+            (dataframe["rsi"] > 55) & (dataframe["volume"] > 0),
+            "enter_short",
+        ] = 1
+        return dataframe
+
+    def populate_exit_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+
+        return dataframe
+
+    def should_exit_partially(self, trade: Trade, current_time: datetime) -> bool:
+        """
+        Determine whether the trade should be partially exited with slices.
+        This method is only intended to be called from strategy callbacks.
+        """
+        dataframe, _ = self.dp.get_analyzed_dataframe(
+            trade.pair, self.timeframe
+        )
+
+        if dataframe.empty:
+            return False
+
+        last_candle = dataframe.iloc[-1]
+        rsi = last_candle["rsi"]
+
+        if trade.is_short:
+            return rsi < 45
+
+        return rsi > 55
+
+    def _ac_kappa_series(self, dataframe: pd.DataFrame, pair: str) -> pd.Series:
+        if dataframe.empty:
+            return pd.Series(dtype=float, index=dataframe.index)
+
+        sigma = dataframe["close"].rolling(self.vol_window).std()
+        avg_spread = (dataframe["high"] - dataframe["low"]).rolling(self.vol_window).mean()
+        avg_volume = dataframe["volume"].rolling(self.vol_window).mean()
+
+        candle_minutes = timeframe_to_minutes(self.timeframe)
+        tau = self.twap_interval_minutes / candle_minutes
+
+        eta = avg_spread / (self.eta_volume_fraction * avg_volume)
+        gamma = avg_spread / (self.gamma_volume_fraction * avg_volume)
+        eta_tilde = eta - 0.5 * gamma * tau
+        eta_tilde = eta_tilde.where(eta_tilde > 0, eta)
+
+        sigma_tau = sigma * math.sqrt(tau)
+        kappa_tilde_sq = (self.factor_lambda * sigma_tau ** 2) / eta_tilde
+        acosh_arg = (0.5 * kappa_tilde_sq * tau ** 2 + 1.0).clip(lower=1.0)
+        raw_kappa = np.arccosh(acosh_arg) / tau
+
+        return raw_kappa.clip(upper=self.kappa_max).fillna(self.kappa_default)
+
+
+
+    def _get_kappa(self, pair: str, current_time: datetime | None = None) -> float:
+        """
+        Get kappa value for slices execution.
+        This method is only intended to be called from strategy callbacks.
+        """
+        if self.dp is None:
+            return self.kappa_default
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if dataframe.empty or "kappa" not in dataframe:
+            return self.kappa_default
+        value = dataframe["kappa"].iloc[-1]
+        return self.kappa_default if pd.isna(value) else float(value)
+
+
+    def _ac_next_slice_fraction(self, remaining_slices: int, kappa: float) -> float:
+        """
+        Fraction of the *currently remaining* amount to trade in the next
+        slice, given `remaining_slices` .
+        kappa == 0 reduces exactly to 1/remaining_slices plain TWAP.
+        """
+        m = remaining_slices
+        if m <= 1:
+            return 1.0
+        if kappa <= 1e-12:
+            return 1.0 / m
+
+        denominator = math.sinh(kappa * m)
+        if denominator == 0:
+            return 1.0 / m
+
+        numerator = math.sinh(kappa * (m - 1))
+        frac = 1.0 - (numerator / denominator)
+        return min(max(frac, 0.0), 1.0)
+
+
+    def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
+                             proposed_stake: float, min_stake: float | None, max_stake: float,
+                             leverage: float, entry_tag: str | None, side: str,
+                             **kwargs) -> float:
+        first_fraction = self._ac_next_slice_fraction(self.twap_num_slices, self._get_kappa(pair))
+        return proposed_stake * first_fraction
+
+    def adjust_trade_position(self, trade: Trade, current_time: datetime,
+                               current_rate: float, current_profit: float,
+                               min_stake: float | None, max_stake: float,
+                               current_entry_rate: float, current_exit_rate: float,
+                               current_entry_profit: float, current_exit_profit: float,
+                               **kwargs
+                               ) -> float | None | tuple[float | None, str | None]:
+
+        if trade.has_open_orders:
+            return None
+
+        filled_entries = trade.select_filled_orders(trade.entry_side)
+        entry_slices_done = len(filled_entries)
+        filled_exits = trade.select_filled_orders(trade.exit_side)
+        exit_slices_done = len(filled_exits)
+
+        already_exiting = exit_slices_done > 0
+
+        if already_exiting or self.should_exit_partially(trade, current_time):
+            return self._next_exit_slice(trade, current_time, filled_exits, exit_slices_done)
+
+        if entry_slices_done < self.twap_num_slices:
+            return self._next_entry_slice(trade, current_time, filled_entries, entry_slices_done, min_stake)
+
+        return None
+
+    def _next_entry_slice(self, trade: Trade, current_time: datetime,
+                           filled_entries: list, slices_done: int, min_stake: float | None
+                           ) -> float | None | tuple[float | None, str | None]:
+
+        last_fill_time = filled_entries[-1].order_filled_utc if filled_entries else trade.open_date_utc
+        next_slice_due_at = last_fill_time + timedelta(minutes=self.twap_interval_minutes)
+        if current_time < next_slice_due_at:
+            return None
+
+        kappa = self._get_kappa(trade.pair)
+
+        first_fraction = self._ac_next_slice_fraction(self.twap_num_slices, kappa)
+        ac_total_stake = filled_entries[0].stake_amount_filled / first_fraction
+
+        stake_already_filled = sum(o.stake_amount_filled for o in filled_entries)
+        remaining_stake = ac_total_stake - stake_already_filled
+        remaining_slices = self.twap_num_slices - slices_done
+
+        if remaining_stake <= 0 or remaining_slices <= 0:
+            return None
+
+        fraction = self._ac_next_slice_fraction(remaining_slices, kappa)
+        next_slice_stake = remaining_stake * fraction
+
+        if next_slice_stake < (min_stake or 0):
+            return None
+
+        return next_slice_stake
+
+    def _next_exit_slice(self, trade: Trade, current_time: datetime,
+                          filled_exits: list, slices_done: int
+                          ) -> float | None | tuple[float | None, str | None]:
+
+        if slices_done >= self.twap_num_slices:
+            return None
+
+        last_fill_time = filled_exits[-1].order_filled_utc if filled_exits else current_time
+        next_slice_due_at = last_fill_time + timedelta(minutes=self.twap_interval_minutes)
+        if slices_done > 0 and current_time < next_slice_due_at:
+            return None
+
+        remaining_slices = self.twap_num_slices - slices_done
+
+        if remaining_slices <= 1:
+            return -trade.stake_amount
+        fraction = self._ac_next_slice_fraction(remaining_slices, self._get_kappa(trade.pair))
+        slice_stake = trade.stake_amount * fraction
+        return -slice_stake
